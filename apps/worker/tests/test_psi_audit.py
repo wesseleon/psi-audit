@@ -1,153 +1,124 @@
-"""Offline tests for the psi-audit workflow: digest correctness with mocked PSI responses."""
-
-from __future__ import annotations
+"""Offline tests for the psi-audit workflow: every HTTP call is mocked."""
 
 import json
-from typing import Any
+import os
+from pathlib import Path
 
 import httpx
 import pytest
 
-from worker.workflows.psi_audit import AuditSiteInput, collect_psi
+WORKFLOWS_DIR = Path(__file__).resolve().parents[1] / "src" / "worker" / "workflows"
+PSI_MODULE_PATH = WORKFLOWS_DIR / "psi_audit.py"
 
-SAMPLE: dict[str, Any] = {
-    "id": "https://example.com/",
-    "captchaResult": "CAPTCHA_NOT_NEEDED",
-    "loadingExperience": {
-        "overall_category": "AVERAGE",
-        "metrics": {
-            "LARGEST_CONTENTFUL_PAINT_MS": {"percentile": 2500, "category": "AVERAGE"},
-        },
-    },
-    "lighthouseResult": {
-        "lighthouseVersion": "13.6.0",
-        "categories": {
-            "performance": {
-                "score": 0.68,
-                "auditRefs": [
-                    {"id": "render-blocking-resources"},
-                    {"id": "unused-javascript"},
-                    {"id": "uses-optimized-images"},
-                ],
-            }
-        },
+pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture()
+def psi(monkeypatch: pytest.MonkeyPatch):
+    """Import the workflow module fresh, with PSI_API_KEY controlled by the test."""
+
+    os.environ.pop("PSI_API_KEY", None)
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("psi_audit", PSI_MODULE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _lighthouse_payload(score: float = 0.92) -> dict:
+    audit = lambda title, val: {  # noqa: E731
+        "id": title,
+        "title": title,
+        "numericValue": val,
+        "score": 0.95,
+        "details": {},
+    }
+    return {
         "audits": {
-            "first-contentful-paint": {"displayValue": "1.2 s", "score": 0.8},
-            "speed-index": {"displayValue": "2.8 s", "score": 0.6},
-            "largest-contentful-paint": {"displayValue": "3.1 s", "score": 0.45},
-            "total-blocking-time": {"displayValue": "480 ms", "score": 0.4},
-            "cumulative-layout-shift": {"displayValue": "0.05", "score": 1.0},
-            "interactive": {"displayValue": "4.0 s", "score": 0.86},
+            "first-contentful-paint": audit("First Contentful Paint", 1200),
+            "largest-contentful-paint": audit("Largest Contentful Paint", 2100),
+            "total-blocking-time": audit("Total Blocking Time", 150),
+            "cumulative-layout-shift": audit("Cumulative Layout Shift", 0.05),
+            "speed-index": audit("Speed Index", 1800),
+            "max-potential-fid": audit("Max Potential FID", 120),
+            "largest-contentful-paint-element": {"details": {"items": [{"node": {"snippet": "<img>"}}]}},
+            "diagnostics": {"details": {"items": [{"numRequests": 42, "totalByteWeight": 900000}]}},
             "render-blocking-resources": {
+                "title": "Eliminate render-blocking resources",
+                "numericValue": 900,
                 "score": 0.5,
-                "details": {"items": [{"overallSavingsMs": 400, "overallSavingsBytes": 51200}]},
+                "details": {"type": "opportunity", "overallSavingsMs": 800},
             },
-            "unused-javascript": {
-                "score": 0.5,
-                "details": {"items": [{"overallSavingsMs": 200, "overallSavingsBytes": 204800}]},
-            },
-            "third-party-summary": {
+            "third-party": {
                 "details": {
                     "items": [
-                        {"entity": "Google Fonts", "totalBytes": 40960, "blockingTime": 120},
-                        "https://fonts.gstatic.com",  # PSI sometimes returns bare strings
+                        {"entity": "googletagmanager.com", "blockingTime": 90},
+                        {"entity": "fonts.example.com", "blockingTime": 0},
                     ]
                 }
             },
-            "mainthread-work-breakdown": {"displayValue": "1.4 s"},
-            "total-byte-weight": {"displayValue": "Total size was 700 KiB"},
-            "largest-contentful-paint-element": {
-                "details": {"items": [{"items": [{"node": {"selector": "body > img.hero", "nodeLabel": "hero.jpg"}}]}]}
-            },
         },
-    },
-}
+        "categories": {"performance": {"score": score}},
+    }
 
 
-class _FakeResponse:
-    def __init__(self, payload: dict[str, Any], status_code: int = 200):
-        self.status_code = status_code
-        self._payload = payload
+async def test_parses_lighthouse_result(psi, monkeypatch):
+    async def fake_send(self, request, **kwargs):
+        payload = {
+            "lighthouseResult": _lighthouse_payload(0.92),
+            "loadingExperience": {
+                "overall_category": "AVERAGE",
+                "metrics": {"largest_contentful_paint": {"percentile": 2500, "category": "NEEDS_IMPROVEMENT"}},
+            },
+        }
+        return httpx.Response(200, json=payload, request=request)
 
-    def json(self) -> dict[str, Any]:
-        return self._payload
-
-
-class _FakeClient:
-    def __init__(self, **kwargs: Any):
-        pass
-
-    async def __aenter__(self) -> "_FakeClient":
-        return self
-
-    async def __aexit__(self, *_exc: object) -> None:
-        return None
-
-    async def get(self, url: str, params: dict[str, str]) -> _FakeResponse:
-        assert url == "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
-        assert params["strategy"] in ("mobile", "desktop")
-        assert params["key"] == "test-key"
-        return _FakeResponse(SAMPLE)
-
-
-class _QuotaClient(_FakeClient):
-    async def get(self, url: str, params: dict[str, str]) -> _FakeResponse:
-        return _FakeResponse(SAMPLE, status_code=429)
-
-
-@pytest.mark.asyncio
-async def test_collect_psi_digest(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
     monkeypatch.setenv("PSI_API_KEY", "test-key")
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
-
-    result = await collect_psi("https://example.com/", "mobile")
-
-    assert result.error is None
-    assert result.performance_score == 68.0
-    assert result.lighthouse_version == "13.6.0"
-    assert len(result.vitals) == 6
-    assert result.vitals[2].audit == "largest-contentful-paint"
-    assert result.vitals[2].display_value == "3.1 s"
-    assert result.field_category == "AVERAGE"
-    assert result.field_data[0].percentile == "2.50s"
-    # Opportunities sorted by estimated savings, string items skipped.
-    assert [o.audit for o in result.opportunities] == ["render-blocking-resources", "unused-javascript"]
-    assert result.opportunities[0].savings_ms == 400
-    assert len(result.third_parties) == 1
-    assert result.third_parties[0].entity == "Google Fonts"
-    assert result.third_parties[0].blocking_ms == 120
-    assert result.diagnostics["mainthread-work-breakdown"] == "1.4 s"
-    assert result.lcp_element == "body > img.hero (hero.jpg)"
+    result = await psi.collect_psi("https://example.com", "mobile")
+    assert result["ok"] is True
+    assert result["performance_score"] == 92
+    assert result["metrics"]["largest-contentful-paint"]["assessment"] == "good"
+    assert result["field_data"]["overall_category"] == "AVERAGE"
+    assert result["opportunities"][0]["audit"] == "render-blocking-resources"
+    assert result["third_parties"][0]["origin"] == "googletagmanager.com"
+    assert result["lcp_element"]
 
 
-@pytest.mark.asyncio
-async def test_collect_psi_missing_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("PSI_API_KEY", raising=False)
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
-
-    result = await collect_psi("https://example.com/", "desktop")
-
-    assert result.error == "PSI_API_KEY is not set on the deployment"
-    assert result.performance_score is None
+async def test_missing_api_key(psi):
+    result = await psi.collect_psi("https://example.com", "mobile")
+    assert result["ok"] is False
+    assert "PSI_API_KEY" in result["error"]
 
 
-@pytest.mark.asyncio
-async def test_collect_psi_quota(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_quota_error(psi, monkeypatch):
+    async def fake_send(self, request, **kwargs):
+        return httpx.Response(429, json={"error": {"message": "Quota exceeded"}}, request=request)
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
     monkeypatch.setenv("PSI_API_KEY", "test-key")
-    monkeypatch.setattr(httpx, "AsyncClient", _QuotaClient)
-
-    result = await collect_psi("https://example.com/", "mobile")
-
-    assert result.error is not None and "429" in result.error
+    result = await psi.collect_psi("https://example.com", "mobile")
+    assert result["ok"] is False
+    assert "429" in result["error"]
 
 
-def test_input_defaults() -> None:
-    parsed = AuditSiteInput.model_validate({"url": "https://rivilo.com"})
-    assert parsed.strategies == ["mobile", "desktop"]
+async def test_no_lighthouse_result(psi, monkeypatch):
+    async def fake_send(self, request, **kwargs):
+        return httpx.Response(200, json={"lighthouseResult": {}}, request=request)
 
-    single = AuditSiteInput.model_validate({"url": "https://rivilo.com", "strategies": ["mobile"]})
-    assert single.strategies == ["mobile"]
+    monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
+    monkeypatch.setenv("PSI_API_KEY", "test-key")
+    result = await psi.collect_psi("https://example.com", "mobile")
+    assert result["ok"] is False
+    assert "no lighthouse result" in result["error"]
 
 
-def test_sample_fixture_is_json() -> None:
-    assert isinstance(json.dumps(SAMPLE), str)
+async def test_workflow_input_defaults(psi):
+    """Input defaults to both strategies and drops unknown ones."""
+
+    data = json.loads(psi.PsiInput(url="https://example.com").model_dump_json())
+    assert data["strategies"] == ["mobile", "desktop"]
+    data2 = json.loads(psi.PsiInput(url="https://example.com", strategies=["tablet", "desktop"]).model_dump_json())
+    assert "desktop" in data2["strategies"]
+    assert "tablet" not in data2["strategies"]

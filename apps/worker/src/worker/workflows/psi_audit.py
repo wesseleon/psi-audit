@@ -1,221 +1,229 @@
-"""PSI performance audit workflow.
+"""Run Google Lighthouse audits through the PageSpeed Insights (PSI) API.
 
-Runs Google Lighthouse audits through the PageSpeed Insights API for one or
-more strategies and returns a structured report. The Google API key is a fixed
-service credential bound from the workspace secret ``psi_api_key`` into the
-``PSI_API_KEY`` environment variable; it is resolved inside the activity only.
+The API key never appears in code: the platform injects the secret bound to the
+deployment as the ``PSI_API_KEY`` environment variable.
 """
 
-from __future__ import annotations
-
+import asyncio
 import os
 from datetime import timedelta
-
-import structlog
-from pydantic import BaseModel, Field
+from typing import Any
 
 import mistralai.workflows as workflows
-
-logger = structlog.get_logger("psi_audit")
+from pydantic import BaseModel, Field, field_validator
 
 PSI_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
-
-METRIC_AUDITS = (
-    "first-contentful-paint",
-    "speed-index",
-    "largest-contentful-paint",
-    "total-blocking-time",
-    "cumulative-layout-shift",
-    "interactive",
-)
+DEFAULT_STRATEGIES = ("mobile", "desktop")
 
 
-class Vital(BaseModel):
+class PsiInput(BaseModel):
+    """Workflow input: the page to audit and the device strategies to run."""
+
+    url: str = Field(description="Absolute page URL to audit, e.g. https://example.com")
+    strategies: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_STRATEGIES),
+        description='Device strategies to audit: "mobile", "desktop" or both.',
+    )
+
+    @field_validator("strategies")
+    @classmethod
+    def _keep_known_strategies(cls, value: list[str]) -> list[str]:
+        known = [s for s in value if s in DEFAULT_STRATEGIES]
+        return known or list(DEFAULT_STRATEGIES)
+
+
+class Metric(BaseModel):
+    """A single lab metric: value plus its category assessment."""
+
+    value: float | None = None
+    assessment: str | None = None
+
+
+class AuditOpportunity(BaseModel):
+    """A savings estimate an audit opportunity reports."""
+
     audit: str
-    display_value: str | None = None
-    score: float | None = None
+    title: str
+    savings_ms: float | None = None
 
 
-class Opportunity(BaseModel):
-    audit: str
-    savings_ms: float = 0
-    savings_bytes: float = 0
-    display_value: str | None = None
+class ThirdParty(BaseModel):
+    """A third-party origin the page loads and its blocking time."""
 
-
-class ThirdPartyImpact(BaseModel):
-    entity: str
-    total_bytes: float = 0
-    blocking_ms: float = 0
-
-
-class FieldMetric(BaseModel):
-    metric_id: str
-    percentile: str | None = None
-    category: str | None = None
+    origin: str
+    blocking_ms: float | None = None
 
 
 class StrategyResult(BaseModel):
+    """Structured PSI report for one strategy."""
+
     strategy: str
-    performance_score: float | None = None
-    lighthouse_version: str | None = None
-    vitals: list[Vital] = Field(default_factory=list)
-    field_data: list[FieldMetric] = Field(default_factory=list)
-    field_category: str | None = None
-    opportunities: list[Opportunity] = Field(default_factory=list)
-    third_parties: list[ThirdPartyImpact] = Field(default_factory=list)
-    lcp_element: str | None = None
-    diagnostics: dict[str, str] = Field(default_factory=dict)
+    ok: bool = False
+    performance_score: int | None = None
     error: str | None = None
+    first_contentful_paint_ms: float | None = None
+    largest_contentful_paint_ms: float | None = None
+    total_blocking_time_ms: float | None = None
+    cumulative_layout_shift: float | None = None
+    speed_index_ms: float | None = None
+    interaction_to_next_paint_ms: float | None = None
+    metrics: dict[str, Metric] = Field(default_factory=dict)
+    field_data: dict[str, Any] = Field(default_factory=dict)
+    opportunities: list[AuditOpportunity] = Field(default_factory=list)
+    third_parties: list[ThirdParty] = Field(default_factory=list)
+    lcp_element: str | None = None
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
 
 
-class AuditSiteInput(BaseModel):
-    """Audit one URL with Lighthouse via the PageSpeed Insights API."""
+def _metric_value(audit: dict[str, Any] | None) -> tuple[float | None, str | None]:
+    """Read numeric value and assessment from a PSI audit item, tolerating gaps."""
 
-    url: str
-    strategies: list[str] = Field(default_factory=lambda: ["mobile", "desktop"])
+    if not isinstance(audit, dict):
+        return None, None
+    raw = audit.get("numericValue")
+    value = float(raw) if isinstance(raw, (int, float)) else None
+    score = audit.get("score")
+    # PSI encodes 0 = fail, 1 = pass; 0.1-0.9 is "needs improvement".
+    if score is None:
+        assessment = "informative"
+    elif score >= 0.9:
+        assessment = "good"
+    elif score >= 0.5:
+        assessment = "needs improvement"
+    else:
+        assessment = "poor"
+    return value, assessment
 
 
-class AuditSiteOutput(BaseModel):
-    url: str
-    results: list[StrategyResult] = Field(default_factory=list)
+def _parse_lightning(result: dict[str, Any]) -> StrategyResult:
+    """Turn one PSI `lighthouseResult` into a StrategyResult."""
+
+    audits: dict[str, Any] = result.get("audits", {})
+    categories = result.get("categories", {})
+    perf = categories.get("performance", {})
+    score = perf.get("score")
+    performance_score = round(float(score) * 100) if isinstance(score, (int, float)) else None
+
+    out = StrategyResult(strategy=result.get("_strategy", ""), ok=True, performance_score=performance_score)
+
+    for key, audit_id in (
+        ("first_contentful_paint_ms", "first-contentful-paint"),
+        ("largest_contentful_paint_ms", "largest-contentful-paint"),
+        ("total_blocking_time_ms", "total-blocking-time"),
+        ("cumulative_layout_shift", "cumulative-layout-shift"),
+        ("speed_index_ms", "speed-index"),
+        ("interaction_to_next_paint_ms", "interactive" if "interactive" in audits else "max-potential-fid"),
+    ):
+        value, assessment = _metric_value(audits.get(audit_id))
+        setattr(out, key, value)
+        if value is not None:
+            out.metrics[audit_id] = Metric(value=value, assessment=assessment)
+
+    opportunities: list[AuditOpportunity] = []
+    for audit_id, audit in audits.items():
+        if not isinstance(audit, dict) or audit.get("details", {}).get("type") != "opportunity":
+            continue
+        details = audit.get("details", {})
+        savings = details.get("overallSavingsMs")
+        if isinstance(savings, (int, float)) and savings >= 10:
+            opportunities.append(
+                AuditOpportunity(
+                    audit=audit_id,
+                    title=audit.get("title", audit_id),
+                    savings_ms=float(savings),
+                )
+            )
+    opportunities.sort(key=lambda o: o.savings_ms or 0, reverse=True)
+    out.opportunities = opportunities[:10]
+
+    third_parties: list[ThirdParty] = []
+    tpa = audits.get("third-party", {}).get("details", {}).get("items", [])
+    for item in tpa:
+        if not isinstance(item, dict):
+            continue
+        blocking = item.get("blockingTime")
+        if isinstance(blocking, (int, float)) and blocking > 0:
+            third_parties.append(ThirdParty(origin=item.get("entity", ""), blocking_ms=float(blocking)))
+    third_parties.sort(key=lambda t: t.blocking_ms or 0, reverse=True)
+    out.third_parties = third_parties[:10]
+
+    lcp_item = audits.get("largest-contentful-paint-element", {}).get("details", {}).get("items", [])
+    if lcp_item:
+        out.lcp_element = str(lcp_item[0])
+
+    diagnostics = audits.get("diagnostics", {}).get("details", {}).get("items", [])
+    if diagnostics:
+        out.diagnostics = diagnostics[0]
+
+    return out
 
 
-def _human_ms(n: float) -> str:
-    return f"{n / 1000:.2f}s" if n >= 1000 else f"{n:.0f}ms"
+def _parse_field_data(section: dict[str, Any] | None) -> dict[str, Any]:
+    """Summarize the CrUX field data section, if the page has traffic."""
+
+    if not isinstance(section, dict) or not section.get("metrics"):
+        return {}
+    metrics: dict[str, Any] = {}
+    for key, metric in section.get("metrics", {}).items():
+        if not isinstance(metric, dict):
+            continue
+        metrics[key] = {"value": metric.get("percentile"), "assessment": metric.get("category")}
+    return {"overall_category": section.get("overall_category"), "metrics": metrics}
+
+
+def _error_message(status: int, body: str) -> str:
+    """Map an HTTP failure to a readable, non-leaking error string."""
+
+    if status == 429:
+        return "PSI quota exceeded (HTTP 429): retry later or request a higher quota."
+    if status in (400, 403):
+        return f"PSI rejected the request (HTTP {status}): check the URL and the API key restrictions."
+    return f"PSI request failed with HTTP {status}."
 
 
 @workflows.activity(start_to_close_timeout=timedelta(seconds=300), retry_policy_max_attempts=1)
-async def collect_psi(url: str, strategy: str) -> StrategyResult:
-    """Fetch one PSI run and reduce it to a compact, business-level result.
+async def collect_psi(url: str, strategy: str) -> dict[str, Any]:
+    """Fetch one PSI report for `url` under `strategy` and structure it."""
 
-    The Google API key never crosses the activity boundary: it is read from the
-    deployment's runtime environment here, sent as a request parameter to the
-    PSI API, and kept out of logs and results. ``retry_policy_max_attempts=1``
-    because a retry would re-bill the key's daily quota for the same run and
-    a partial failure is surfaced, not replayed.
-    """
+    # Imported here so the module stays importable without httpx (worker startup,
+    # offline tests) and semgrep's import rules are satisfied.
     import httpx
 
     api_key = os.environ.get("PSI_API_KEY", "").strip()
     if not api_key:
-        return StrategyResult(strategy=strategy, error="PSI_API_KEY is not set on the deployment")
+        return StrategyResult(
+            strategy=strategy, ok=False, error="PSI_API_KEY is not set: bind the psi_api_key secret to the deployment."
+        ).model_dump()
 
-    params = {
-        "url": url,
-        "strategy": strategy,
-        "category": "performance",
-        "key": api_key,
-    }
-    async with httpx.AsyncClient(timeout=180.0) as client:
+    params = {"url": url, "strategy": strategy, "key": api_key, "category": "performance"}
+    async with httpx.AsyncClient(timeout=120) as client:
         response = await client.get(PSI_ENDPOINT, params=params)
 
-    if response.status_code == 429:
-        return StrategyResult(strategy=strategy, error="PSI quota exceeded (HTTP 429); retry later or check the Google Cloud quota")
-    if response.status_code in (400, 403):
-        return StrategyResult(strategy=strategy, error=f"PSI rejected the request (HTTP {response.status_code}); check the URL and the API key restrictions")
+    if response.status_code != 200:
+        return StrategyResult(strategy=strategy, ok=False, error=_error_message(response.status_code, response.text)).model_dump()
 
-    data = response.json()
-    lighthouse = data.get("lighthouseResult") or {}
-    audits = lighthouse.get("audits") or {}
-    categories = lighthouse.get("categories") or {}
-    performance = categories.get("performance") or {}
-    score = performance.get("score")
+    payload = response.json()
+    lighthouse = payload.get("lighthouseResult", {})
+    if not lighthouse:
+        return StrategyResult(
+            strategy=strategy, ok=False, error="PSI returned no lighthouse result for this URL."
+        ).model_dump()
 
-    result = StrategyResult(
-        strategy=strategy,
-        performance_score=round(score * 100, 1) if score is not None else None,
-        lighthouse_version=lighthouse.get("lighthouseVersion"),
-    )
-
-    for audit_id in METRIC_AUDITS:
-        audit = audits.get(audit_id) or {}
-        if audit:
-            result.vitals.append(
-                Vital(
-                    audit=audit_id,
-                    display_value=audit.get("displayValue"),
-                    score=audit.get("score"),
-                )
-            )
-
-    loading = data.get("loadingExperience") or {}
-    result.field_category = loading.get("overall_category")
-    for metric_id, metric in (loading.get("metrics") or {}).items():
-        percentile = metric.get("percentile")
-        result.field_data.append(
-            FieldMetric(
-                metric_id=metric_id,
-                percentile=_human_ms(percentile) if percentile is not None else None,
-                category=metric.get("category"),
-            )
-        )
-
-    for ref in performance.get("auditRefs", []):
-        audit = audits.get(ref.get("id")) or {}
-        details = audit.get("details") or {}
-        savings_ms = 0.0
-        savings_bytes = 0.0
-        for item in details.get("items") or []:
-            if not isinstance(item, dict):
-                continue
-            savings_ms += item.get("overallSavingsMs") or 0
-            savings_bytes += item.get("overallSavingsBytes") or 0
-        if audit.get("score") is not None and audit["score"] < 1 and (savings_ms or savings_bytes):
-            result.opportunities.append(
-                Opportunity(
-                    audit=ref["id"],
-                    savings_ms=savings_ms,
-                    savings_bytes=savings_bytes,
-                    display_value=audit.get("displayValue"),
-                )
-            )
-    result.opportunities.sort(key=lambda o: (o.savings_ms, o.savings_bytes), reverse=True)
-
-    third_party = (audits.get("third-party-summary") or {}).get("details") or {}
-    for item in third_party.get("items") or []:
-        if not isinstance(item, dict):
-            continue
-        result.third_parties.append(
-            ThirdPartyImpact(
-                entity=item.get("entity") or item.get("url") or "?",
-                total_bytes=item.get("totalBytes") or 0,
-                blocking_ms=item.get("blockingTime") or item.get("blocking") or 0,
-            )
-        )
-
-    for diagnostic in ("mainthread-work-breakdown", "bootup-time", "dom-size", "server-response-time", "total-byte-weight"):
-        audit = audits.get(diagnostic) or {}
-        if audit.get("displayValue"):
-            result.diagnostics[diagnostic] = audit["displayValue"]
-
-    lcp = audits.get("largest-contentful-paint-element") or {}
-    items = (lcp.get("details") or {}).get("items") or []
-    if items:
-        try:
-            node = items[0]["items"][0]["node"]
-            result.lcp_element = f"{node.get('selector', '?')} ({str(node.get('nodeLabel', '')).strip()})"
-        except (KeyError, IndexError, TypeError):
-            pass
-
-    logger.info(
-        "psi run complete",
-        url=url,
-        strategy=strategy,
-        performance_score=result.performance_score,
-    )
-    return result
+    parsed = _parse_lightning(lighthouse)
+    parsed.strategy = strategy
+    parsed.field_data = _parse_field_data(payload.get("loadingExperience", {}))
+    return parsed.model_dump()
 
 
-@workflows.workflow.define(
-    name="psi-audit",
-    workflow_display_name="PSI Audit",
-    workflow_description="Run Google Lighthouse audits (PageSpeed Insights API) for a URL, mobile and desktop, and return a structured performance report.",
-)
+@workflows.workflow.define(name="psi-audit")
 class PsiAuditWorkflow:
+    """Audit `url` with Lighthouse on the requested strategies, in parallel."""
+
     @workflows.workflow.entrypoint
-    async def run(self, input: AuditSiteInput) -> AuditSiteOutput:
-        results: list[StrategyResult] = []
-        for strategy in input.strategies:
-            results.append(await collect_psi(input.url, strategy))
-        return AuditSiteOutput(url=input.url, results=results)
+    async def run(self, audit: PsiInput) -> dict[str, Any]:
+        strategies = [s for s in audit.strategies if s in DEFAULT_STRATEGIES] or list(DEFAULT_STRATEGIES)
+
+        futures = [collect_psi(audit.url, strategy) for strategy in strategies]
+        results = await asyncio.gather(*futures)
+        by_strategy = {r["strategy"]: r for r in results if isinstance(r, dict) and r.get("strategy")}
+        return {"url": audit.url, "results": by_strategy}

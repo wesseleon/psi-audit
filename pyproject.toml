@@ -2,7 +2,7 @@
 name = "app-workspace"
 version = "0.0.1"
 requires-python = ">=3.12,<3.15"
-dependencies = []
+dependencies = ["mistralai-capabilities-backend-workflows"]
 
 [tool.uv]
 package = false
@@ -34,6 +34,7 @@ url = "https://pypi.org/simple"
 default = true
 
 [tool.uv.sources]
+mistralai-capabilities-backend-workflows = { workspace = true }
 
 # Globs, not an enumeration, so the member set follows capability selection with no hand-editing. A
 # capability's published `package/py` toolkit is not a member: the CLI wires selected toolkits into
