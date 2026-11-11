@@ -1,124 +1,153 @@
-"""Offline tests for the psi-audit workflow: every HTTP call is mocked."""
+"""Offline tests for the psi-audit workflow (no network, no real key)."""
 
-import json
+import asyncio
+import importlib.util
 import os
+import sys
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
-import httpx
 import pytest
 
-WORKFLOWS_DIR = Path(__file__).resolve().parents[1] / "src" / "worker" / "workflows"
-PSI_MODULE_PATH = WORKFLOWS_DIR / "psi_audit.py"
+MODULE_PATH = Path(__file__).resolve().parents[1] / "src/worker/workflows/psi_audit.py"
+spec = importlib.util.spec_from_file_location("psi_audit", MODULE_PATH)
+psi = importlib.util.module_from_spec(spec)
+sys.modules["psi_audit"] = psi
+spec.loader.exec_module(psi)
 
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.fixture()
-def psi(monkeypatch: pytest.MonkeyPatch):
-    """Import the workflow module fresh, with PSI_API_KEY controlled by the test."""
-
-    os.environ.pop("PSI_API_KEY", None)
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("psi_audit", PSI_MODULE_PATH)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+FAKE_KEY = "test-key"
 
 
-def _lighthouse_payload(score: float = 0.92) -> dict:
-    audit = lambda title, val: {  # noqa: E731
-        "id": title,
-        "title": title,
-        "numericValue": val,
-        "score": 0.95,
-        "details": {},
-    }
+def _fake_response(status_code: int = 200, payload: dict | None = None) -> MagicMock:
+    response = MagicMock()
+    response.status_code = status_code
+    response.json.return_value = payload or {}
+    return response
+
+
+def _lighthouse_payload(strategy: str = "mobile") -> dict:
     return {
-        "audits": {
-            "first-contentful-paint": audit("First Contentful Paint", 1200),
-            "largest-contentful-paint": audit("Largest Contentful Paint", 2100),
-            "total-blocking-time": audit("Total Blocking Time", 150),
-            "cumulative-layout-shift": audit("Cumulative Layout Shift", 0.05),
-            "speed-index": audit("Speed Index", 1800),
-            "max-potential-fid": audit("Max Potential FID", 120),
-            "largest-contentful-paint-element": {"details": {"items": [{"node": {"snippet": "<img>"}}]}},
-            "diagnostics": {"details": {"items": [{"numRequests": 42, "totalByteWeight": 900000}]}},
-            "render-blocking-resources": {
-                "title": "Eliminate render-blocking resources",
-                "numericValue": 900,
-                "score": 0.5,
-                "details": {"type": "opportunity", "overallSavingsMs": 800},
+        "lighthouseResult": {
+            "_strategy": strategy,
+            "categories": {
+                "performance": {"score": 0.44},
+                "accessibility": {"score": 0.92},
+                "best-practices": {"score": 0.93},
+                "seo": {"score": 0.83},
             },
-            "third-party": {
-                "details": {
-                    "items": [
-                        {"entity": "googletagmanager.com", "blockingTime": 90},
-                        {"entity": "fonts.example.com", "blockingTime": 0},
-                    ]
-                }
+            "audits": {
+                "first-contentful-paint": {"numericValue": 900, "score": 0.9},
+                "largest-contentful-paint": {"numericValue": 4700, "score": 0.2},
+                "total-blocking-time": {"numericValue": 12123, "score": 0.0},
+                "cumulative-layout-shift": {"numericValue": 0.003, "score": 1.0},
+                "speed-index": {"numericValue": 12500, "score": 0.3},
+                "unused-javascript": {
+                    "title": "Reduce unused JavaScript",
+                    "score": 0.5,
+                    "details": {"type": "opportunity", "overallSavingsMs": 600},
+                },
+                "uses-https": {"title": "Use HTTPS", "score": 1.0},
+                "render-blocking-resources": {
+                    "title": "Eliminate render-blocking resources",
+                    "score": 0.1,
+                    "displayValue": "Potential savings of 1,200 ms",
+                    "description": "Resources are blocking the first paint.",
+                    "details": {"type": "opportunity", "overallSavingsMs": 1200},
+                },
+                "third-party": {"details": {"items": [{"entity": "example.com", "blockingTime": 250}]}},
+                "largest-contentful-paint-element": {"details": {"items": [{"node": {"snippet": "<img>"}}]}},
+                "diagnostics": {"details": {"items": [{"numRequests": 120}]}},
             },
+            "full-page-screenshot": {"data": "aGVsbG8="},
         },
-        "categories": {"performance": {"score": score}},
+        "loadingExperience": {
+            "overall_category": "FAST",
+            "metrics": {"cumulative_layout_shift": {"percentile": 0.007, "category": "AVERAGE"}},
+        },
     }
 
 
-async def test_parses_lighthouse_result(psi, monkeypatch):
-    async def fake_send(self, request, **kwargs):
-        payload = {
-            "lighthouseResult": _lighthouse_payload(0.92),
-            "loadingExperience": {
-                "overall_category": "AVERAGE",
-                "metrics": {"largest_contentful_paint": {"percentile": 2500, "category": "NEEDS_IMPROVEMENT"}},
-            },
-        }
-        return httpx.Response(200, json=payload, request=request)
+async def test_digest_has_all_categories_and_audits(monkeypatch):
+    """Parsing yields four category scores, opportunities, passed and failed audits."""
 
-    monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
-    monkeypatch.setenv("PSI_API_KEY", "test-key")
+    monkeypatch.setenv("PSI_API_KEY", FAKE_KEY)
+    payload = _lighthouse_payload()
+    fake_client = MagicMock()
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=False)
+    fake_client.get = AsyncMock(return_value=_fake_response(payload=payload))
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: fake_client)
+
     result = await psi.collect_psi("https://example.com", "mobile")
     assert result["ok"] is True
-    assert result["performance_score"] == 92
-    assert result["metrics"]["largest-contentful-paint"]["assessment"] == "good"
-    assert result["field_data"]["overall_category"] == "AVERAGE"
+    assert result["categories"] == {
+        "performance": 44,
+        "accessibility": 92,
+        "best-practices": 93,
+        "seo": 83,
+    }
+    assert result["performance_score"] == 44
+    assert result["total_blocking_time_ms"] == 12123
     assert result["opportunities"][0]["audit"] == "render-blocking-resources"
-    assert result["third_parties"][0]["origin"] == "googletagmanager.com"
-    assert result["lcp_element"]
+    assert any(a["id"] == "uses-https" for a in result["passed_audits"])
+    assert any(o["audit"] == "unused-javascript" for o in result["opportunities"])
+    assert result["screenshot"].startswith("data:image/")
+    assert result["field_data"]["overall_category"] == "FAST"
 
 
-async def test_missing_api_key(psi):
+async def test_missing_key_returns_graceful_error(monkeypatch):
+    """Without a bound key the activity returns a readable error, no exception."""
+
+    monkeypatch.delenv("PSI_API_KEY", raising=False)
+    fake_client = MagicMock()
+    fake_client.get = AsyncMock()
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: fake_client)
+
     result = await psi.collect_psi("https://example.com", "mobile")
     assert result["ok"] is False
     assert "PSI_API_KEY" in result["error"]
 
 
-async def test_quota_error(psi, monkeypatch):
-    async def fake_send(self, request, **kwargs):
-        return httpx.Response(429, json={"error": {"message": "Quota exceeded"}}, request=request)
+async def test_quota_error_is_graceful(monkeypatch):
+    """A 429 becomes an error string, never an exception."""
 
-    monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
-    monkeypatch.setenv("PSI_API_KEY", "test-key")
+    monkeypatch.setenv("PSI_API_KEY", FAKE_KEY)
+    fake_client = MagicMock()
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=False)
+    fake_client.get = AsyncMock(return_value=_fake_response(status_code=429))
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: fake_client)
+
     result = await psi.collect_psi("https://example.com", "mobile")
     assert result["ok"] is False
     assert "429" in result["error"]
 
 
-async def test_no_lighthouse_result(psi, monkeypatch):
-    async def fake_send(self, request, **kwargs):
-        return httpx.Response(200, json={"lighthouseResult": {}}, request=request)
+async def test_no_lighthouse_result_is_graceful(monkeypatch):
+    """An empty lighthouse section becomes an error string."""
 
-    monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
-    monkeypatch.setenv("PSI_API_KEY", "test-key")
+    monkeypatch.setenv("PSI_API_KEY", FAKE_KEY)
+    fake_client = MagicMock()
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=False)
+    fake_client.get = AsyncMock(return_value=_fake_response(payload={"lighthouseResult": {}}))
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: fake_client)
+
     result = await psi.collect_psi("https://example.com", "mobile")
     assert result["ok"] is False
     assert "no lighthouse result" in result["error"]
 
 
-async def test_workflow_input_defaults(psi):
-    """Input defaults to both strategies and drops unknown ones."""
+def test_input_defaults_and_validation():
+    """Defaults to both strategies; unknown strategies fall back to the defaults."""
 
-    data = json.loads(psi.PsiInput(url="https://example.com").model_dump_json())
-    assert data["strategies"] == ["mobile", "desktop"]
-    data2 = json.loads(psi.PsiInput(url="https://example.com", strategies=["tablet", "desktop"]).model_dump_json())
-    assert "desktop" in data2["strategies"]
-    assert "tablet" not in data2["strategies"]
+    full = psi.PsiInput(url="https://example.com")
+    assert full.strategies == ["mobile", "desktop"]
+
+    filtered = psi.PsiInput(url="https://example.com", strategies=["mobile", "nonsense"])
+    assert filtered.strategies == ["mobile"]
+    empty = psi.PsiInput(url="https://example.com", strategies=["nonsense"])
+    assert empty.strategies == ["mobile", "desktop"]

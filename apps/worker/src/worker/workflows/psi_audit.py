@@ -1,7 +1,8 @@
 """Run Google Lighthouse audits through the PageSpeed Insights (PSI) API.
 
 The API key never appears in code: the platform injects the secret bound to the
-deployment as the ``PSI_API_KEY`` environment variable.
+deployment as the ``PSI_API_KEY`` environment variable. All four Lighthouse
+categories are requested, matching what the PageSpeed Insights site shows.
 """
 
 import asyncio
@@ -14,6 +15,8 @@ from pydantic import BaseModel, Field, field_validator
 
 PSI_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 DEFAULT_STRATEGIES = ("mobile", "desktop")
+# Every category the PSI site reports.
+CATEGORIES = ("performance", "accessibility", "best-practices", "seo")
 
 
 class PsiInput(BaseModel):
@@ -54,13 +57,25 @@ class ThirdParty(BaseModel):
     blocking_ms: float | None = None
 
 
+class AuditResult(BaseModel):
+    """A single audit in brief: weight and, for failures, what to fix."""
+
+    id: str
+    title: str
+    state: str  # pass / fail / informative
+    display: str | None = None
+    description: str | None = None
+    savings_ms: float | None = None
+
+
 class StrategyResult(BaseModel):
-    """Structured PSI report for one strategy."""
+    """Structured PSI report for one strategy, all categories."""
 
     strategy: str
     ok: bool = False
     performance_score: int | None = None
     error: str | None = None
+    categories: dict[str, int] = Field(default_factory=dict)  # all four scores 0-100
     first_contentful_paint_ms: float | None = None
     largest_contentful_paint_ms: float | None = None
     total_blocking_time_ms: float | None = None
@@ -70,9 +85,12 @@ class StrategyResult(BaseModel):
     metrics: dict[str, Metric] = Field(default_factory=dict)
     field_data: dict[str, Any] = Field(default_factory=dict)
     opportunities: list[AuditOpportunity] = Field(default_factory=list)
+    passed_audits: list[AuditResult] = Field(default_factory=list)
+    failed_audits: list[AuditResult] = Field(default_factory=list)
     third_parties: list[ThirdParty] = Field(default_factory=list)
     lcp_element: str | None = None
     diagnostics: dict[str, Any] = Field(default_factory=dict)
+    screenshot: str | None = None
 
 
 def _metric_value(audit: dict[str, Any] | None) -> tuple[float | None, str | None]:
@@ -83,7 +101,6 @@ def _metric_value(audit: dict[str, Any] | None) -> tuple[float | None, str | Non
     raw = audit.get("numericValue")
     value = float(raw) if isinstance(raw, (int, float)) else None
     score = audit.get("score")
-    # PSI encodes 0 = fail, 1 = pass; 0.1-0.9 is "needs improvement".
     if score is None:
         assessment = "informative"
     elif score >= 0.9:
@@ -95,16 +112,46 @@ def _metric_value(audit: dict[str, Any] | None) -> tuple[float | None, str | Non
     return value, assessment
 
 
+def _category_score(audits: dict[str, Any], category: dict[str, Any]) -> int | None:
+    """A category score can come with scoreOverrideMode=informative; use its audits then."""
+
+    raw = category.get("score")
+    if isinstance(raw, (int, float)):
+        return round(float(raw) * 100)
+    # Manual mode: average the referenced audits' scores.
+    refs = category.get("auditRefs", [])
+    scores = []
+    for ref in refs:
+        audit = audits.get(ref.get("id") if isinstance(ref, dict) else None, {})
+        s = audit.get("score") if isinstance(audit, dict) else None
+        if isinstance(s, (int, float)):
+            scores.append(s)
+    return round(sum(scores) / len(scores) * 100) if scores else None
+
+
+def _audit_state(audit: dict[str, Any]) -> str:
+    score = audit.get("score")
+    if score is None:
+        return "informative"
+    return "pass" if score >= 0.9 else "fail"
+
+
 def _parse_lightning(result: dict[str, Any]) -> StrategyResult:
     """Turn one PSI `lighthouseResult` into a StrategyResult."""
 
     audits: dict[str, Any] = result.get("audits", {})
     categories = result.get("categories", {})
-    perf = categories.get("performance", {})
-    score = perf.get("score")
-    performance_score = round(float(score) * 100) if isinstance(score, (int, float)) else None
+    out = StrategyResult(strategy=result.get("_strategy", ""), ok=True)
 
-    out = StrategyResult(strategy=result.get("_strategy", ""), ok=True, performance_score=performance_score)
+    scores: dict[str, int] = {}
+    for cat_id, cat in categories.items():
+        if not isinstance(cat, dict):
+            continue
+        s = _category_score(audits, cat)
+        if s is not None:
+            scores[cat_id] = s
+    out.categories = scores
+    out.performance_score = scores.get("performance")
 
     for key, audit_id in (
         ("first_contentful_paint_ms", "first-contentful-paint"),
@@ -120,21 +167,40 @@ def _parse_lightning(result: dict[str, Any]) -> StrategyResult:
             out.metrics[audit_id] = Metric(value=value, assessment=assessment)
 
     opportunities: list[AuditOpportunity] = []
+    passed: list[AuditResult] = []
+    failed: list[AuditResult] = []
     for audit_id, audit in audits.items():
-        if not isinstance(audit, dict) or audit.get("details", {}).get("type") != "opportunity":
+        if not isinstance(audit, dict):
             continue
-        details = audit.get("details", {})
-        savings = details.get("overallSavingsMs")
-        if isinstance(savings, (int, float)) and savings >= 10:
-            opportunities.append(
-                AuditOpportunity(
-                    audit=audit_id,
+        details = audit.get("details", {}) if isinstance(audit.get("details"), dict) else {}
+        state = _audit_state(audit)
+        if details.get("type") == "opportunity":
+            savings = details.get("overallSavingsMs")
+            if isinstance(savings, (int, float)) and savings >= 10:
+                opportunities.append(
+                    AuditOpportunity(audit=audit_id, title=audit.get("title", audit_id), savings_ms=float(savings))
+                )
+            continue
+        # Keep informative audits out; track scored pass/fail for parity with the PSI site.
+        if state == "pass":
+            passed.append(AuditResult(id=audit_id, title=audit.get("title", audit_id), state=state))
+        elif state == "fail":
+            failed.append(
+                AuditResult(
+                    id=audit_id,
                     title=audit.get("title", audit_id),
-                    savings_ms=float(savings),
+                    state=state,
+                    display=audit.get("displayValue"),
+                    description=audit.get("description"),
                 )
             )
     opportunities.sort(key=lambda o: o.savings_ms or 0, reverse=True)
     out.opportunities = opportunities[:10]
+    out.failed_audits = [
+        a for a in failed
+        if a.id not in {o.audit for o in out.opportunities}
+    ][:20]
+    out.passed_audits = passed
 
     third_parties: list[ThirdParty] = []
     tpa = audits.get("third-party", {}).get("details", {}).get("items", [])
@@ -154,6 +220,12 @@ def _parse_lightning(result: dict[str, Any]) -> StrategyResult:
     diagnostics = audits.get("diagnostics", {}).get("details", {}).get("items", [])
     if diagnostics:
         out.diagnostics = diagnostics[0]
+
+    shot = result.get("full-page-screenshot", {})
+    if isinstance(shot, dict):
+        data = shot.get("data")
+        if isinstance(data, str):
+            out.screenshot = f"data:image/jpeg;base64,{data}" if not data.startswith("data:") else data
 
     return out
 
@@ -181,7 +253,7 @@ def _error_message(status: int, body: str) -> str:
     return f"PSI request failed with HTTP {status}."
 
 
-@workflows.activity(start_to_close_timeout=timedelta(seconds=300), retry_policy_max_attempts=1)
+@workflows.activity(start_to_close_timeout=timedelta(seconds=420), retry_policy_max_attempts=1)
 async def collect_psi(url: str, strategy: str) -> dict[str, Any]:
     """Fetch one PSI report for `url` under `strategy` and structure it."""
 
@@ -195,8 +267,9 @@ async def collect_psi(url: str, strategy: str) -> dict[str, Any]:
             strategy=strategy, ok=False, error="PSI_API_KEY is not set: bind the psi_api_key secret to the deployment."
         ).model_dump()
 
-    params = {"url": url, "strategy": strategy, "key": api_key, "category": "performance"}
-    async with httpx.AsyncClient(timeout=120) as client:
+    params: dict[str, Any] = {"url": url, "strategy": strategy, "key": api_key}
+    params["category"] = list(CATEGORIES)
+    async with httpx.AsyncClient(timeout=240) as client:
         response = await client.get(PSI_ENDPOINT, params=params)
 
     if response.status_code != 200:

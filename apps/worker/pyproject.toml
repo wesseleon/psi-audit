@@ -1,32 +1,28 @@
 [project]
-name = "workflows-app"
+name = "worker"
 version = "0.1.0"
+description = "psi-audit worker"
 requires-python = ">=3.12,<3.15"
 dependencies = [
-    "utils",
-    "env",
-    "mistralai>=3.6.0",
-    "mistralai-workflows[mistralai]>=3.17.1",
-    "pydantic>=2.14.1",
-    "structlog>=25.5.0",
     "httpx>=0.28.0",
+    "mistralai-capabilities-backend-workflows",
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.4.0", "pytest-asyncio>=1.0.0"]
-
-[build-system]
-requires = ["uv_build>=0.8.22,<0.9.0"]
-build-backend = "uv_build"
-
-[tool.uv.build-backend]
-module-name = "worker"
-
-[tool.uv.sources]
-utils = { workspace = true }
-env = { workspace = true }
-mistralai-workflows = { index = "pypi" }
+dev = [
+    "pytest>=8.4.0",
+    "pytest-asyncio>=1.0.0",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/worker"]
+
+[tool.uv.sources]
+mistralai-capabilities-backend-workflows = { workspace = true }
